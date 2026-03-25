@@ -1,0 +1,13 @@
+# Supplemental Python dependencies for LG-RSD + AttnFPN reproduction.
+# Install the local Ultralytics fork separately with:
+#   python -m pip install -e method/yolov8
+
+pycocotools
+opencv-python
+matplotlib
+pandas
+tqdm
+pyyaml
+gdown
+thop
+

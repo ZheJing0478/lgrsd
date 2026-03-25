@@ -1,0 +1,193 @@
+diff --git a/ultralytics/cfg/default.yaml b/ultralytics/cfg/default.yaml
+index 27f9849..2c17f44 100644
+--- a/ultralytics/cfg/default.yaml
++++ b/ultralytics/cfg/default.yaml
+@@ -128,3 +128,13 @@ cfg: # (str, optional) path to a config.yaml that overrides defaults
+ 
+ # Tracker settings ------------------------------------------------------------------------------------------------------
+ tracker: botsort.yaml # (str) tracker config file: botsort.yaml or bytetrack.yaml
++
++# LG-RSD (Local-Global Region Self-Distillation) ---------------------------------------------------------------
++enable_lgrsd: False # (bool) enable train-time-only LG-RSD loss (no inference overhead)
++lgrsd_lambda: 0.5 # (float) weight of LG-RSD loss
++lgrsd_topk_per_image: 16 # (int) max GT boxes sampled per image to compute LG-RSD
++lgrsd_crop_size: 224 # (int) crop patch size for teacher view
++lgrsd_roi_size: 7 # (int) ROIAlign output size for student view
++lgrsd_feature_level: auto # (str) 'auto' (P3/P4/P5 by scale) or 'P3-only'
++lgrsd_embed_dim: 256 # (int) embedding dim for z_roi/z_crop
++enable_region_contrastive: False # (bool) optional InfoNCE term (default off)
+diff --git a/ultralytics/models/yolo/detect/train.py b/ultralytics/models/yolo/detect/train.py
+index 66795a7..93dfd0c 100644
+--- a/ultralytics/models/yolo/detect/train.py
++++ b/ultralytics/models/yolo/detect/train.py
+@@ -142,6 +142,11 @@ class DetectionTrainer(BaseTrainer):
+         self.model.nc = self.data["nc"]  # attach number of classes to model
+         self.model.names = self.data["names"]  # attach class names to model
+         self.model.args = self.args  # attach hyperparameters to model
++        # LG-RSD adds train-time-only projection heads; attach them BEFORE optimizer creation.
++        if bool(getattr(self.args, "enable_lgrsd", False)):
++            from ultralytics_ext.losses import ensure_lgrsd_modules
++
++            ensure_lgrsd_modules(self.model)
+         # TODO: self.model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
+ 
+     def get_model(self, cfg: str | None = None, weights: str | None = None, verbose: bool = True):
+@@ -162,7 +167,9 @@ class DetectionTrainer(BaseTrainer):
+ 
+     def get_validator(self):
+         """Return a DetectionValidator for YOLO model validation."""
+-        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
++        self.loss_names = ("box_loss", "cls_loss", "dfl_loss", "lgrsd_loss") if bool(
++            getattr(self.args, "enable_lgrsd", False)
++        ) else ("box_loss", "cls_loss", "dfl_loss")
+         return yolo.detect.DetectionValidator(
+             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+         )
+diff --git a/ultralytics/nn/modules/__init__.py b/ultralytics/nn/modules/__init__.py
+index 5377a61..703d042 100644
+--- a/ultralytics/nn/modules/__init__.py
++++ b/ultralytics/nn/modules/__init__.py
+@@ -102,6 +102,9 @@ from .transformer import (
+     TransformerLayer,
+ )
+ 
++# Project-local extensions (kept outside upstream package for minimal-intrusion diffs)
++from ultralytics_ext.modules import C2fECA, ECA
++
+ __all__ = (
+     "AIFI",
+     "C1",
+@@ -127,6 +130,7 @@ __all__ = (
+     "Bottleneck",
+     "BottleneckCSP",
+     "C2f",
++    "C2fECA",
+     "C2fAttn",
+     "C2fCIB",
+     "C2fPSA",
+@@ -144,6 +148,7 @@ __all__ = (
+     "ConvTranspose",
+     "DWConv",
+     "DWConvTranspose2d",
++    "ECA",
+     "DeformableTransformerDecoder",
+     "DeformableTransformerDecoderLayer",
+     "Detect",
+diff --git a/ultralytics/nn/tasks.py b/ultralytics/nn/tasks.py
+index 6346fef..9bc1b79 100644
+--- a/ultralytics/nn/tasks.py
++++ b/ultralytics/nn/tasks.py
+@@ -30,6 +30,7 @@ from ultralytics.nn.modules import (
+     Bottleneck,
+     BottleneckCSP,
+     C2f,
++    C2fECA,
+     C2fAttn,
+     C2fCIB,
+     C2fPSA,
+@@ -46,6 +47,7 @@ from ultralytics.nn.modules import (
+     Detect,
+     DWConv,
+     DWConvTranspose2d,
++    ECA,
+     Focus,
+     GhostBottleneck,
+     GhostConv,
+@@ -166,6 +168,8 @@ class BaseModel(torch.nn.Module):
+             (torch.Tensor): The last output of the model.
+         """
+         y, dt, embeddings = [], [], []  # outputs
++        cache_lgrsd = bool(getattr(self, "_lgrsd_cache", False))
++        lgrsd_saved: dict[int, torch.Tensor] = {} if cache_lgrsd else {}
+         embed = frozenset(embed) if embed is not None else {-1}
+         max_idx = max(embed)
+         for m in self.model:
+@@ -174,13 +178,20 @@ class BaseModel(torch.nn.Module):
+             if profile:
+                 self._profile_one_layer(m, x, dt)
+             x = m(x)  # run
+-            y.append(x if m.i in self.save else None)  # save output
++            if m.i in self.save:
++                y.append(x)
++                if cache_lgrsd:
++                    lgrsd_saved[m.i] = x
++            else:
++                y.append(None)
+             if visualize:
+                 feature_visualization(x, m.type, m.i, save_dir=visualize)
+             if m.i in embed:
+                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                 if m.i == max_idx:
+                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
++        if cache_lgrsd:
++            setattr(self, "_lgrsd_saved_feats", lgrsd_saved)
+         return x
+ 
+     def _predict_augment(self, x):
+@@ -307,9 +318,16 @@ class BaseModel(torch.nn.Module):
+             c1, c2, h, w = state_dict[first_conv].shape
+             cc1, cc2, ch, cw = csd[first_conv].shape
+             if ch == h and cw == w:
+-                c1, c2 = min(c1, cc1), min(c2, cc2)
+-                state_dict[first_conv][:c1, :c2] = csd[first_conv][:c1, :c2]
+-                len_updated_csd += 1
++                # Special case: RGB pretrained -> 1-channel model (better than copying only channel-0).
++                if c2 == 1 and cc2 == 3:
++                    state_dict[first_conv][: min(c1, cc1), :1] = csd[first_conv][: min(c1, cc1), :3].mean(
++                        dim=1, keepdim=True
++                    )
++                    len_updated_csd += 1
++                else:
++                    c1, c2 = min(c1, cc1), min(c2, cc2)
++                    state_dict[first_conv][:c1, :c2] = csd[first_conv][:c1, :c2]
++                    len_updated_csd += 1
+         if verbose:
+             LOGGER.info(f"Transferred {len_updated_csd}/{len(self.model.state_dict())} items from pretrained weights")
+ 
+@@ -324,7 +342,15 @@ class BaseModel(torch.nn.Module):
+             self.criterion = self.init_criterion()
+ 
+         if preds is None:
++            # LG-RSD needs intermediate FPN feature maps from the student forward pass.
++            # We enable a lightweight cache only during this forward, and keep it OFF for any
++            # extra forward passes inside the loss (e.g., crop-teacher, debug).
++            enable_lgrsd = bool(getattr(getattr(self, "args", None), "enable_lgrsd", False))
++            if enable_lgrsd:
++                setattr(self, "_lgrsd_cache", True)
+             preds = self.forward(batch["img"])
++            if enable_lgrsd:
++                setattr(self, "_lgrsd_cache", False)
+         return self.criterion(preds, batch)
+ 
+     def init_criterion(self):
+@@ -481,7 +507,13 @@ class DetectionModel(BaseModel):
+ 
+     def init_criterion(self):
+         """Initialize the loss criterion for the DetectionModel."""
+-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
++        if getattr(self, "end2end", False):
++            return E2EDetectLoss(self)
++        if bool(getattr(getattr(self, "args", None), "enable_lgrsd", False)):
++            from ultralytics_ext.losses import v8DetectionLossWithRSD
++
++            return v8DetectionLossWithRSD(self)
++        return v8DetectionLoss(self)
+ 
+ 
+ class OBBModel(DetectionModel):
+@@ -1535,6 +1567,7 @@ def parse_model(d, ch, verbose=True):
+             C1,
+             C2,
+             C2f,
++            C2fECA,
+             C3k2,
+             RepNCSPELAN4,
+             ELAN1,
+@@ -1561,6 +1594,7 @@ def parse_model(d, ch, verbose=True):
+             C1,
+             C2,
+             C2f,
++            C2fECA,
+             C3k2,
+             C2fAttn,
+             C3,
