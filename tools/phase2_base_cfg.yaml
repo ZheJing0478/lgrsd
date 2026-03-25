@@ -1,0 +1,37 @@
+# Phase2: fixed hyperparameters to enforce fair comparisons across methods.
+# NOTE: imgsz/epochs/batch/device are still passed via CLI in tools/train_all.sh.
+
+seed: 42
+deterministic: True
+
+# Optimizer / LR
+optimizer: SGD
+lr0: 0.01
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 3.0
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+
+# Augmentations (YOLOv8 defaults, but we pin them explicitly)
+degrees: 0.0
+translate: 0.1
+scale: 0.5
+shear: 0.0
+perspective: 0.0
+flipud: 0.0
+fliplr: 0.5
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+mosaic: 1.0
+mixup: 0.0
+copy_paste: 0.0
+cutmix: 0.0
+close_mosaic: 10
+
+# LG-RSD (default pinned for reproducibility; overridden by CLI in tools/train_all.sh when needed)
+lgrsd_teacher_momentum: 1.0
+
+
